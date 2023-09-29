@@ -1,28 +1,161 @@
 ---
-title: ""
-author: ""
+title: "lab5"
+author: "senxiong mo"
 format:
   html:
     embed-resources: true
 ---
-
-## Quarto
-
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
-
-## Running Code
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
-
 ```{r}
-1 + 1
+library(data.table)
+library(R.utils)
+met_url <- "https://github.com/USCbiostats/data-science-data/raw/master/02_met/met_all.gz"
+tmp <- "met.gz"
+if (!file.exists(tmp)) {
+  download.file(
+    url      = met_url,
+    destfile = tmp,
+  )
+}
+dat <- fread(tmp)
+head(dat)
 ```
 
-You can add options to executable code like this
-
 ```{r}
-#| echo: false
-2 * 2
+library(tidyverse)
+stations <- fread("ftp://ftp.ncdc.noaa.gov/pub/data/noaa/isd-history.csv")
+stations[, USAF := as.integer(USAF)]
+
+stations[, USAF   := fifelse(USAF == 999999, NA_integer_, USAF)]
+stations[, CTRY   := fifelse(CTRY == "", NA_character_, CTRY)]
+stations[, STATE  := fifelse(STATE == "", NA_character_, STATE)]
+
+stations <- unique(stations[, list(USAF, CTRY, STATE)])
+
+stations <- stations[!is.na(USAF)]
+
+stations[, n := 1:.N, by = .(USAF)]
+stations <- stations[n == 1,][, n := NULL]
+```
+```{r}
+merge(
+  x     = dat,      
+  y     = stations, 
+  by.x  = "USAFID",
+  by.y  = "USAF", 
+  all.x = TRUE,      
+  all.y = FALSE
+  ) %>% nrow()
+
+stations[, n := 1:.N, by = .(USAF)]
+stations <- stations[n == 1,][, n := NULL]
+
+dat <- merge(
+  x     = dat,      
+  y     = stations, 
+  by.x  = "USAFID",
+  by.y  = "USAF", 
+  all.x = TRUE,      
+  all.y = FALSE
+  )
+head(dat[, list(USAFID, WBAN, STATE)], n = 4)
+```
+# 1.
+```{r}
+station_mean<- dat[,.(
+  temp = mean(temp, na.rm = TRUE),
+  wind.sp = mean(wind.sp, na.rm = TRUE),
+  atm.press = mean(atm.press, na.rm = TRUE)
+), by = USAFID]
+
+medians<- station_mean[,.(
+  temp_mean= quantile(temp, probs= .5, na.rm= TRUE),
+  wind_mean= quantile(wind.sp, probs= .5, na.rm= TRUE),
+  atm_mean= quantile(atm.press, probs= .5, na.rm= TRUE)
+)]
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+```{r}
+station_mean[,temp_dist:=abs(temp-medians$temp_mean)]
+median_temp_station<-station_mean[order(temp_dist)][1]
+median_temp_station
+
+station_mean[,wind_dist:=abs(wind.sp-medians$wind_mean)]
+median_wind_station<-station_mean[order(wind_dist)][1]
+median_wind_station
+
+station_mean[,atmo_dist:=abs(atm.press-medians$atm_mean)]
+median_atmo_station<-station_mean[order(atmo_dist)][1]
+median_atmo_station
+```
+
+For the closest median temperature, the station is 720458. For the closest median wind speed, the station is 720929.  For the closest median atm press, the station is 723200.
+
+# 2.
+```{r}
+state_station<-merge(x = station_mean, y = stations,
+                     by.x = "USAFID", by.y = "USAF",
+                     all.x = TRUE, all.y = FALSE)
+
+state_station[, temp50 := quantile(temp, probs = .5, na.rm = TRUE), by = STATE]
+state_station[, wind50 := quantile(wind.sp, probs = .5, na.rm = TRUE), by = STATE]
+state_station[, atm50 := quantile(atm.press, probs = .5, na.rm = TRUE), by = STATE]
+
+state_station[, euclidean_distance:= sqrt((temp - temp50)^2 + (wind.sp - wind50)^2)]
+
+state_station[ , .SD[which.min(euclidean_distance)], by = STATE]
+```
+
+# 3.
+```{r}
+library(leaflet)
+library(dplyr)
+state_station[, mid_point := sqrt(((temp - temp50)^2 + (wind.sp - wind50)^2) / 2 )]
+data_m<- state_station[ , .SD[which.min(mid_point)], by = STATE]
+
+table1 <- dat%>%
+  select(USAFID, lat, lon)
+table1<- distinct(table1, USAFID, .keep_all = TRUE)
+
+data_m2<- merge(x = data_m, y = table1, by.x = 'USAFID', by.y = "USAFID", all.x = TRUE, all.y = FALSE)
+
+tempmap <- leaflet(data_m2) %>% 
+  addProviderTiles('CartoDB.Positron') %>% 
+  addCircles(
+    lat = ~lat, lng=~lon,
+    label = ~paste0(round(temp,2), ' C'), 
+    color = ~colorNumeric(c('red','green','blue'), domain=data_m2$mid_point)(mid_point),
+    opacity = 1, 
+    fillOpacity = 1, 
+    radius = 500) %>%
+  addLegend(pal=colorNumeric(c('red','green','blue'), domain=data_m2$mid_point), values=data_m2$mid_point,title='Midpoint', opacity=1)
+tempmap
+```
+
+# 4.
+```{r}
+dat[, state_temp := mean(temp, na.rm = TRUE), by = STATE]
+dat[, temp_level := fifelse(
+  state_temp < 20, "low-temp", 
+  fifelse(state_temp < 25 & state_temp>=20, "mid-temp", 
+          "high-temp"))
+  ]
+
+table(dat$temp_level, useNA = "always")
+
+dat[, .(
+  N_entries = .N,
+  N_stations = length(unique(USAFID)),
+  N_missing = sum(is.na(.SD)),
+  N_states = length(unique(STATE)),
+  temperature_mean = mean(temp, na.rm = TRUE),
+  windspeed_mean = mean(wind.sp, na.rm = TRUE),
+  atmopress_mean= mean(atm.press, na.rm = TRUE)
+), by = temp_level]
+```
+
+
+
+
+
+
+
